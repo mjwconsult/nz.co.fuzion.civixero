@@ -276,15 +276,8 @@ class CRM_Civixero_Contact extends CRM_Civixero_Base {
 
         $xeroContactUUID = !empty($record['accounts_contact_id']) ? $record['accounts_contact_id'] : NULL;
         $accountsContact = $this->mapToAccounts($contact, $xeroContactUUID);
-        if ($accountsContact === FALSE) {
-          $result = FALSE;
-          $responseErrors = [];
-        }
-        else {
-          /** @noinspection PhpUndefinedMethodInspection */
-          $result = $this->getSingleton($params['connector_id'])->Contacts($accountsContact);
-          $responseErrors = $this->validateResponse($result);
-        }
+        $result = $this->pushToXero($accountsContact, $params['connector_id']);
+        $responseErrors = $result === FALSE ? [] : $this->validateResponse($result);
         if ($result === FALSE) {
           unset($record['accounts_modified_date']);
         }
@@ -369,6 +362,29 @@ class CRM_Civixero_Contact extends CRM_Civixero_Base {
       throw new CRM_Core_Exception(E::ts('Not all contacts were saved') . print_r($errors, TRUE), 'incomplete', $errors);
     }
     return TRUE;
+  }
+
+  /**
+   * Push a single mapped contact to Xero.
+   *
+   * The only method the Xero-SDK migration touches - push()'s surrounding
+   * orchestration (error handling, throttle abort, DB updates) does not
+   * care which client this delegates to underneath.
+   *
+   * @param array|bool $accountsContact
+   *   Mapped contact array as produced by mapToAccounts(), or FALSE if a
+   *   hook vetoed the push.
+   * @param int $connector_id
+   *
+   * @return array|bool
+   *   FALSE if $accountsContact was FALSE, otherwise the raw Xero response.
+   */
+  protected function pushToXero($accountsContact, $connector_id) {
+    if ($accountsContact === FALSE) {
+      return FALSE;
+    }
+    /** @noinspection PhpUndefinedMethodInspection */
+    return $this->getSingleton($connector_id)->Contacts($accountsContact);
   }
 
   /**
