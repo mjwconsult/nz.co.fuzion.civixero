@@ -110,7 +110,7 @@ class CRM_Civixero_Contact extends CRM_Civixero_Base {
     }
   }
 
-  private function processPull($contacts, int $connectorID) {
+  protected function processPull($contacts, int $connectorID) {
     $errors = $ids = [];
 
     foreach ($contacts as $xeroContactID => $xeroContact) {
