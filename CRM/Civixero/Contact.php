@@ -276,15 +276,8 @@ class CRM_Civixero_Contact extends CRM_Civixero_Base {
 
         $xeroContactUUID = !empty($record['accounts_contact_id']) ? $record['accounts_contact_id'] : NULL;
         $accountsContact = $this->mapToAccounts($contact, $xeroContactUUID);
-        if ($accountsContact === FALSE) {
-          $result = FALSE;
-          $responseErrors = [];
-        }
-        else {
-          /** @noinspection PhpUndefinedMethodInspection */
-          $result = $this->getSingleton($params['connector_id'])->Contacts($accountsContact);
-          $responseErrors = $this->validateResponse($result);
-        }
+        $result = $this->pushToXero($accountsContact, $params['connector_id']);
+        $responseErrors = $result === FALSE ? [] : $this->validateResponse($result);
         if ($result === FALSE) {
           unset($record['accounts_modified_date']);
         }
@@ -369,6 +362,152 @@ class CRM_Civixero_Contact extends CRM_Civixero_Base {
       throw new CRM_Core_Exception(E::ts('Not all contacts were saved') . print_r($errors, TRUE), 'incomplete', $errors);
     }
     return TRUE;
+  }
+
+  /**
+   * Push a single mapped contact to Xero.
+   *
+   * The only method the Xero-SDK migration touches - push()'s surrounding
+   * orchestration (error handling, throttle abort, DB updates) does not
+   * care which client this delegates to underneath.
+   *
+   * @param array|bool $accountsContact
+   *   Mapped contact array as produced by mapToAccounts(), or FALSE if a
+   *   hook vetoed the push.
+   * @param int $connector_id
+   *
+   * @return array|bool
+   *   FALSE if $accountsContact was FALSE, otherwise the raw Xero response.
+   *
+   * @throws \CRM_Core_Exception
+   */
+  protected function pushToXero($accountsContact, $connector_id) {
+    if ($accountsContact === FALSE) {
+      return FALSE;
+    }
+    try {
+      return $this->pushViaApi($accountsContact);
+    }
+    catch (\XeroAPI\XeroPHP\ApiException $e) {
+      if ($e->getCode() === 429) {
+        $retryAfterSeconds = (int) ($e->getResponseHeaders()['Retry-After'][0] ?? 0);
+        throw new CRM_Civixero_Exception_XeroThrottle($e->getMessage(), $e->getCode(), $e, $retryAfterSeconds ? (time() + $retryAfterSeconds) : NULL);
+      }
+      throw new CRM_Core_Exception(
+        'Synchronization error ' . $e->getMessage(),
+        'xero_' . $e->getCode(),
+        ['response' => $e->getResponseBody()]
+      );
+    }
+  }
+
+  /**
+   * Push a single mapped contact to Xero via the official SDK.
+   *
+   * Replaces the legacy hand-rolled client (packages/Xero/Xero.php). Mirrors
+   * Invoice::pushViaApi()/BankTransaction::pushViaApi()'s shape-preserving
+   * adapter: returns the exact legacy-shaped array
+   * (['Contacts']['Contact'][...]] or ['ValidationErrors' => [...]]) that
+   * push() already reads, so none of push()'s downstream field-extraction
+   * or dedupe logic needs to change.
+   *
+   * @param array $mapped
+   *   CamelCase-keyed contact array as produced by mapToAccounts().
+   *
+   * @return array
+   *
+   * @throws \CRM_Core_Exception
+   */
+  protected function pushViaApi(array $mapped): array {
+    $xeroContact = $this->mappedArrayToXeroContact($mapped);
+
+    $contacts = new \XeroAPI\XeroPHP\Models\Accounting\Contacts();
+    $contacts->setContacts([$xeroContact]);
+
+    // summarize_errors = FALSE: per-contact validation errors come back on
+    // the contact object instead of a blanket HTTP 400.
+    $response = $this->getAccountingApiInstance()->updateOrCreateContacts(
+      $this->getTenantID(),
+      $contacts,
+      FALSE,
+      $this->generateIdempotencyKey('contact-' . ($mapped['ContactNumber'] ?? '0'), $mapped)
+    );
+
+    $returned = $response->getContacts()[0] ?? NULL;
+    if ($returned === NULL) {
+      throw new CRM_Core_Exception('Xero returned no contact from updateOrCreateContacts');
+    }
+    $validationErrors = $this->extractValidationErrors($returned);
+    if ($validationErrors !== []) {
+      return ['ValidationErrors' => $validationErrors];
+    }
+
+    $snapshot = json_decode((string) $returned, TRUE) ?: [];
+    $updated = $returned->getUpdatedDateUtcAsDate();
+    $snapshot['ContactID'] = $returned->getContactId();
+    $snapshot['UpdatedDateUTC'] = $updated ? $updated->format('Y-m-d H:i:s') : date('Y-m-d H:i:s');
+    $snapshot['Name'] = $returned->getName();
+    return ['Contacts' => ['Contact' => $snapshot]];
+  }
+
+  /**
+   * @return string[]
+   */
+  private function extractValidationErrors($model): array {
+    $messages = [];
+    foreach ($model->getValidationErrors() ?? [] as $validationError) {
+      $messages[] = $validationError->getMessage();
+    }
+    return $messages;
+  }
+
+  /**
+   * Convert a CamelCase mapped-contact array (from mapToAccounts()) to an
+   * SDK Contact model.
+   *
+   * Field lengths are clamped to Xero's documented limits so a single bad
+   * value cannot fail the whole push.
+   */
+  private function mappedArrayToXeroContact(array $mapped): \XeroAPI\XeroPHP\Models\Accounting\Contact {
+    $xeroContact = new \XeroAPI\XeroPHP\Models\Accounting\Contact();
+    if (!empty($mapped['ContactID'])) {
+      $this->assertValidXeroGuid((string) $mapped['ContactID'], 'Xero contact reference (ContactID)');
+      $xeroContact->setContactId($mapped['ContactID']);
+    }
+    $xeroContact->setName($mapped['Name']);
+    $xeroContact->setContactNumber((string) $mapped['ContactNumber']);
+    if (($mapped['FirstName'] ?? '') !== '') {
+      $xeroContact->setFirstName($mapped['FirstName']);
+    }
+    if (($mapped['LastName'] ?? '') !== '') {
+      $xeroContact->setLastName($mapped['LastName']);
+    }
+    if (($mapped['EmailAddress'] ?? '') !== '') {
+      $xeroContact->setEmailAddress($mapped['EmailAddress']);
+    }
+
+    if (!empty($mapped['Phones']['Phone']['PhoneNumber'])) {
+      $phone = new \XeroAPI\XeroPHP\Models\Accounting\Phone();
+      $phone->setPhoneType(\XeroAPI\XeroPHP\Models\Accounting\Phone::PHONE_TYPE__DEFAULT);
+      $phone->setPhoneNumber(mb_substr((string) $mapped['Phones']['Phone']['PhoneNumber'], 0, 50));
+      $xeroContact->setPhones([$phone]);
+    }
+
+    if (!empty($mapped['Addresses']['Address'][0])) {
+      $mappedAddress = $mapped['Addresses']['Address'][0];
+      $address = new \XeroAPI\XeroPHP\Models\Accounting\Address();
+      $address->setAddressType(\XeroAPI\XeroPHP\Models\Accounting\Address::ADDRESS_TYPE_POBOX);
+      $address->setAddressLine1(mb_substr((string) ($mappedAddress['AddressLine1'] ?? ''), 0, 500));
+      $address->setAddressLine2(mb_substr((string) ($mappedAddress['AddressLine2'] ?? ''), 0, 500));
+      $address->setAddressLine3(mb_substr((string) ($mappedAddress['AddressLine3'] ?? ''), 0, 500));
+      $address->setAddressLine4(mb_substr((string) ($mappedAddress['AddressLine4'] ?? ''), 0, 500));
+      $address->setCity(mb_substr((string) ($mappedAddress['City'] ?? ''), 0, 255));
+      $address->setPostalCode(mb_substr((string) ($mappedAddress['PostalCode'] ?? ''), 0, 50));
+      $address->setCountry(mb_substr((string) ($mappedAddress['Country'] ?? ''), 0, 50));
+      $address->setRegion(mb_substr((string) ($mappedAddress['Region'] ?? ''), 0, 255));
+      $xeroContact->setAddresses([$address]);
+    }
+    return $xeroContact;
   }
 
   /**
