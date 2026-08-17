@@ -27,6 +27,19 @@ class InvoicePushTest extends TestCase implements HeadlessInterface, HookInterfa
   use Api3TestTrait;
   use ContactTestTrait;
 
+  /**
+   * Set TRUE within a test to make hook_civicrm_accountPushAlterMapped() veto the mapping.
+   *
+   * @var bool
+   */
+  public bool $vetoPushMapping = FALSE;
+
+  public function hook_civicrm_accountPushAlterMapped($entity, &$data, &$save, &$params) {
+    if ($this->vetoPushMapping) {
+      $save = FALSE;
+    }
+  }
+
   public function setUpHeadless(): CiviEnvBuilder {
     return \Civi\Test::headless()
       ->install('org.civicrm.search_kit')
@@ -206,6 +219,106 @@ class InvoicePushTest extends TestCase implements HeadlessInterface, HookInterfa
     // never attempted.
     $this->assertCount(1, $invoice->pushToXeroCalls);
     $this->assertNotEmpty(Civi::settings()->get('xero_oauth_rate_exceeded'));
+  }
+
+  public function testPushSkipsAndMarksResolvedWhenAlreadyCompletedInXero(): void {
+    $fixture = $this->createQueuedAccountInvoice();
+    $this->callAPISuccess('AccountInvoice', 'create', [
+      'id' => $fixture['account_invoice_id'],
+      'accounts_invoice_id' => 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      'accounts_status_id' => CRM_Core_PseudoConstant::getKey('CRM_Accountsync_BAO_AccountInvoice', 'accounts_status_id', 'completed'),
+    ]);
+    $invoice = new InvoicePushTestable([]);
+
+    $count = $invoice->push(['connector_id' => 0], 10);
+
+    // Pushing would fail Xero-side (can't apply our default, non-Completed
+    // status to an invoice that already has payments allocated), so it's
+    // skipped before pushToXero() is ever called.
+    $this->assertEquals(0, $count);
+    $this->assertCount(0, $invoice->pushToXeroCalls);
+    $saved = $this->callAPISuccessGetSingle('AccountInvoice', ['id' => $fixture['account_invoice_id']]);
+    $this->assertStringContainsString('already completed in Xero', $saved['error_data']);
+    // Not a real error - nothing to do - so it shouldn't show up in error reports.
+    $this->assertEquals(1, $saved['is_error_resolved']);
+    $this->assertEquals(0, $saved['accounts_needs_update']);
+  }
+
+  public function testPushStillPushesWhenExistingXeroInvoiceIsNotYetCompleted(): void {
+    // The common flow: an invoice was already pushed to Xero (has a UUID)
+    // and is still pending/authorised there - a later push (e.g. an amount
+    // correction, or just re-syncing) must still go through. Only a
+    // Completed/Paid Xero invoice should be skipped.
+    $fixture = $this->createQueuedAccountInvoice();
+    $this->callAPISuccess('AccountInvoice', 'create', [
+      'id' => $fixture['account_invoice_id'],
+      'accounts_invoice_id' => 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      'accounts_status_id' => CRM_Core_PseudoConstant::getKey('CRM_Accountsync_BAO_AccountInvoice', 'accounts_status_id', 'pending'),
+    ]);
+    $invoice = new InvoicePushTestable([]);
+    $invoice->pushToXeroQueue[] = [
+      'result' => [
+        'Invoices' => [
+          'Invoice' => [
+            'InvoiceID' => 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+            'UpdatedDateUTC' => '2024-03-15 10:00:00',
+            'Status' => 'AUTHORISED',
+          ],
+        ],
+      ],
+    ];
+
+    $count = $invoice->push(['connector_id' => 0], 10);
+
+    $this->assertEquals(1, $count);
+    $this->assertCount(1, $invoice->pushToXeroCalls);
+    // mapToAccounts() returns [$new_invoice] (a single-element list, not wrapped in an 'Invoice' key).
+    $this->assertEquals('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', $invoice->pushToXeroCalls[0][0]['InvoiceID']);
+  }
+
+  public function testPushSkipsAndMarksResolvedWhenHookVetoesTheMapping(): void {
+    $fixture = $this->createQueuedAccountInvoice();
+    $this->vetoPushMapping = TRUE;
+    $invoice = new InvoicePushTestable([]);
+
+    $count = $invoice->push(['connector_id' => 0], 10);
+
+    $this->assertEquals(0, $count);
+    $this->assertCount(0, $invoice->pushToXeroCalls);
+    $saved = $this->callAPISuccessGetSingle('AccountInvoice', ['id' => $fixture['account_invoice_id']]);
+    $this->assertStringContainsString('Ignored via accountPushAlterMapped hook', $saved['error_data']);
+    // The hook explicitly chose to exclude this invoice - not a real error.
+    $this->assertEquals(1, $saved['is_error_resolved']);
+    $this->assertEquals(0, $saved['accounts_needs_update']);
+  }
+
+  public function testPushRecordsUnresolvedErrorWhenAccountInvoiceHasNoContributionId(): void {
+    // Represents an AccountInvoice pulled from Xero that has no matching
+    // CiviCRM contribution (yet) - previously this crashed push() when it
+    // got as far as mapCancelled(), instead of being skipped cleanly.
+    $accountInvoice = $this->callAPISuccess('AccountInvoice', 'create', [
+      'plugin' => 'xero',
+      'connector_id' => 0,
+      'accounts_invoice_id' => 'aaaaaaaa-bbbb-cccc-dddd-ffffffffffff',
+      'accounts_needs_update' => 1,
+    ]);
+    $invoice = new InvoicePushTestable([]);
+
+    // This is a real problem (not a no-op like the already-completed case), so unlike
+    // that case it counts as a failure and surfaces via the aggregate exception.
+    try {
+      $invoice->push(['connector_id' => 0], 10);
+      $this->fail('Expected push() to throw because the record has no Contribution ID');
+    }
+    catch (CRM_Core_Exception $e) {
+      $this->assertStringContainsString('no Contribution ID', $e->getMessage());
+    }
+
+    $this->assertCount(0, $invoice->pushToXeroCalls);
+    $saved = $this->callAPISuccessGetSingle('AccountInvoice', ['id' => $accountInvoice['id']]);
+    $this->assertStringContainsString('no Contribution ID', $saved['error_data']);
+    $this->assertEquals(0, $saved['is_error_resolved']);
+    $this->assertEquals(0, $saved['accounts_needs_update']);
   }
 
 }
